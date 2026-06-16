@@ -68,16 +68,16 @@ const waitMinutesByPreviousThenNext = {
 
   iron: {
     zinc: 120,
-    magnesium: 1,
+    magnesium: 120,
   },
 
   zinc: {
-    iron: 60,
+    iron: 120,
     magnesium: 30,
   },
 
   magnesium: {
-    iron: 30,
+    iron: 120,
     zinc: 30,
   },
 };
@@ -96,6 +96,8 @@ const finMedication = {
   reminderIntervalMinutes: 1440,
 };
 
+const undoWindowHours = 4;
+
 bot.start(async (context) => {
   await context.reply("Transmuting inside the abyss, listening.");
 });
@@ -110,6 +112,54 @@ bot.command("fin", async (context) => {
 
 bot.action("fin_taken", async (context) => {
   await markFinMedicationTaken(context, { shouldEditMessage: true });
+});
+
+bot.command("undo", async (context) => {
+  await showUndoChoices(context);
+});
+
+bot.action(/^undo:(.+)$/, async (context) => {
+  const supplementIdToUndo = resolveSupplementId(context.match[1]);
+  const telegramChatId = String(context.chat.id);
+
+  const undoneLog = await undoMostRecentLogInWindow({
+    telegramChatId,
+    supplementId: supplementIdToUndo,
+  });
+
+  if (!undoneLog) {
+    await context.answerCbQuery("Nothing to undo");
+    await context.reply("Nothing to undo for that in the last 4 hours.");
+    return;
+  }
+
+  const isFin = supplementIdToUndo === finMedication.id;
+  const supplement = isFin
+    ? { displayName: finMedication.displayName }
+    : getSupplementById(supplementIdToUndo);
+
+  if (!supplement) {
+    await context.answerCbQuery("Unknown");
+    return;
+  }
+
+  await refreshAllLoopStateEligibleTimes();
+
+  await context.answerCbQuery(`Reversed ${supplement.displayName}`);
+
+  await context.editMessageText(
+    `Reversed: ${supplement.displayName} (logged at ${formatTimeForUser(undoneLog.taken_at)}).`
+  );
+
+  if (isFin) {
+    await maybePromptAfterFinUndo(context, telegramChatId);
+    return;
+  }
+
+  await maybePromptAfterVitaminUndo(context, {
+    telegramChatId,
+    undoneSupplementId: supplementIdToUndo,
+  });
 });
 
 bot.on("text", async (context) => {
@@ -348,6 +398,245 @@ async function getEligibleTimeForSupplement({ telegramChatId, supplementId }) {
   });
 
   let latestEligibleAt = ownCooldownEligibleAt;
+
+  for (const previousSupplement of supplements) {
+    const waitMinutes = getWaitMinutesBetweenSupplements({
+      previousSupplementId: previousSupplement.id,
+      nextSupplementId: canonicalSupplementId,
+    });
+
+    const noPairWaitForThisCombo = waitMinutes === 0;
+
+    if (noPairWaitForThisCombo) {
+      continue;
+    }
+
+    const lastTakenLog = await getLastConsumedLogForSupplement({
+      telegramChatId,
+      supplementId: previousSupplement.id,
+    });
+
+    if (!lastTakenLog) {
+      continue;
+    }
+
+    const pairWaitEligibleAt = getPairWaitEligibleTime({
+      previousSupplementId: previousSupplement.id,
+      nextSupplementId: canonicalSupplementId,
+      previousConsumedAt: lastTakenLog.taken_at,
+    });
+
+    const pairWaitEndsLater = pairWaitEligibleAt > latestEligibleAt;
+
+    if (pairWaitEndsLater) {
+      latestEligibleAt = pairWaitEligibleAt;
+    }
+  }
+
+  return latestEligibleAt;
+}
+
+async function showUndoChoices(context) {
+  const telegramChatId = String(context.chat.id);
+  const recentLogs = await getMostRecentLogsPerSupplementInUndoWindow(telegramChatId);
+
+  if (recentLogs.length === 0) {
+    await context.reply("Nothing taken in the last 4 hours to reverse.");
+    return;
+  }
+
+  const undoButtons = [];
+
+  for (const log of recentLogs) {
+    const isFin = log.supplement_id === finMedication.id;
+    const supplement = isFin
+      ? { id: finMedication.id, displayName: finMedication.displayName }
+      : getSupplementById(log.supplement_id);
+
+    if (!supplement) {
+      continue;
+    }
+
+    undoButtons.push([
+      {
+        text: `${supplement.displayName} (${formatTimeForUser(log.taken_at)})`,
+        callback_data: `undo:${supplement.id}`,
+      },
+    ]);
+  }
+
+  if (undoButtons.length === 0) {
+    await context.reply("Nothing taken in the last 4 hours to reverse.");
+    return;
+  }
+
+  await context.reply("Reverse a log from the last 4 hours:", {
+    reply_markup: {
+      inline_keyboard: undoButtons,
+    },
+  });
+}
+
+async function getMostRecentLogsPerSupplementInUndoWindow(telegramChatId) {
+  const undoWindowStart = getUndoWindowStartTime().toISOString();
+
+  const { data: recentLogs, error } = await supabase
+    .from("taken_logs")
+    .select("*")
+    .eq("telegram_chat_id", telegramChatId)
+    .gte("taken_at", undoWindowStart)
+    .order("taken_at", { ascending: false });
+
+  if (error) {
+    console.error("Failed to get recent logs for undo:", error);
+    return [];
+  }
+
+  const mostRecentLogBySupplement = new Map();
+
+  for (const log of recentLogs) {
+    const canonicalSupplementId = resolveSupplementId(log.supplement_id);
+    const alreadyHaveLogForSupplement = mostRecentLogBySupplement.has(
+      canonicalSupplementId
+    );
+
+    if (!alreadyHaveLogForSupplement) {
+      mostRecentLogBySupplement.set(canonicalSupplementId, log);
+    }
+  }
+
+  return [...mostRecentLogBySupplement.values()];
+}
+
+async function undoMostRecentLogInWindow({ telegramChatId, supplementId }) {
+  const supplementIdsToCheck = getSupplementIdsForHistoryLookup(supplementId);
+  const undoWindowStart = getUndoWindowStartTime().toISOString();
+
+  const { data: logToUndo, error: fetchError } = await supabase
+    .from("taken_logs")
+    .select("*")
+    .eq("telegram_chat_id", telegramChatId)
+    .in("supplement_id", supplementIdsToCheck)
+    .gte("taken_at", undoWindowStart)
+    .order("taken_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (fetchError) {
+    console.error("Failed to find log to undo:", fetchError);
+    return null;
+  }
+
+  if (!logToUndo) {
+    return null;
+  }
+
+  const { error: deleteError } = await supabase
+    .from("taken_logs")
+    .delete()
+    .eq("id", logToUndo.id);
+
+  if (deleteError) {
+    console.error("Failed to delete log:", deleteError);
+    return null;
+  }
+
+  return logToUndo;
+}
+
+function getUndoWindowStartTime() {
+  const undoWindowInMilliseconds = undoWindowHours * 60 * 60 * 1000;
+  const undoWindowStart = Date.now() - undoWindowInMilliseconds;
+
+  return new Date(undoWindowStart);
+}
+
+async function maybePromptAfterVitaminUndo(context, { telegramChatId, undoneSupplementId }) {
+  const vitaminScheduleExists = await hasVitaminSchedule(telegramChatId);
+
+  if (vitaminScheduleExists) {
+    await context.reply("Your vitamin reminder schedule is unchanged.");
+    return;
+  }
+
+  const pairWaitsAreClear = await isSupplementClearByPairWaitsOnly({
+    telegramChatId,
+    supplementId: undoneSupplementId,
+  });
+
+  if (!pairWaitsAreClear) {
+    await context.reply("Pair waits still apply before that can come up again.");
+    return;
+  }
+
+  const supplement = getSupplementById(undoneSupplementId);
+
+  await context.reply(
+    `Nothing is scheduled. Mark ${supplement.displayName} if you are taking it now:`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: supplement.displayName,
+              callback_data: `consumed:${supplement.id}`,
+            },
+          ],
+        ],
+      },
+    }
+  );
+}
+
+async function maybePromptAfterFinUndo(context, telegramChatId) {
+  const finIsOnCooldown = await isFinOnCooldown(telegramChatId);
+
+  if (finIsOnCooldown) {
+    await context.reply("Fin is still on its 24-hour timer from an older log.");
+    return;
+  }
+
+  await context.reply("Mark fin if you are taking it now:", {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: finMedication.displayName,
+            callback_data: "fin_taken",
+          },
+        ],
+      ],
+    },
+  });
+}
+
+async function hasVitaminSchedule(telegramChatId) {
+  const { data: loopState, error } = await supabase
+    .from("loop_states")
+    .select("telegram_chat_id")
+    .eq("telegram_chat_id", telegramChatId)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Failed to check vitamin schedule:", error);
+    return false;
+  }
+
+  return loopState != null;
+}
+
+async function isSupplementClearByPairWaitsOnly({ telegramChatId, supplementId }) {
+  const eligibleAtFromPairWaitsOnly = await getEligibleTimeFromPairWaitsOnly({
+    telegramChatId,
+    supplementId,
+  });
+
+  return eligibleAtFromPairWaitsOnly <= new Date();
+}
+
+async function getEligibleTimeFromPairWaitsOnly({ telegramChatId, supplementId }) {
+  const canonicalSupplementId = resolveSupplementId(supplementId);
+  let latestEligibleAt = new Date(0);
 
   for (const previousSupplement of supplements) {
     const waitMinutes = getWaitMinutesBetweenSupplements({
