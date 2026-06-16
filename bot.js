@@ -289,19 +289,9 @@ bot.action(/^next:(.+)$/, async (context) => {
     return;
   }
 
-  const lastConsumedLog = await getLastConsumedSupplementLog(telegramChatId);
-
-  if (!lastConsumedLog) {
-    await context.answerCbQuery("No previous vitamin");
-    await context.reply("I do not know what was consumed last. Summon me again.");
-    return;
-  }
-
-  const nextEligibleAt = await getNextEligibleTime({
+  const nextEligibleAt = await getEligibleTimeForSupplement({
     telegramChatId,
-    previousSupplementId: lastConsumedLog.supplement_id,
-    nextSupplementId,
-    previousConsumedAt: lastConsumedLog.taken_at,
+    supplementId: nextSupplementId,
   });
 
   const loopStateWasSaved = await saveLoopState({
@@ -316,56 +306,125 @@ bot.action(/^next:(.+)$/, async (context) => {
     return;
   }
 
-  const previousSupplement = getSupplementById(lastConsumedLog.supplement_id);
-
-  const pairWaitMinutes = getWaitMinutesBetweenSupplements({
-    previousSupplementId: lastConsumedLog.supplement_id,
-    nextSupplementId,
+  const ownCooldownEligibleAt = await getOwnCooldownEligibleTime({
+    telegramChatId,
+    supplementId: nextSupplementId,
   });
 
-  const ownCooldownEligibleAt = await getOwnCooldownEligibleTime({
+  const activePairWaits = await getActivePairWaitsForSupplement({
     telegramChatId,
     supplementId: nextSupplementId,
   });
 
   await context.answerCbQuery(`${nextSupplement.displayName} selected`);
 
-  await context.editMessageText(
-    [
-      `Next selected: ${nextSupplement.displayName}.`,
-      "",
-      `Previous consumed: ${previousSupplement.displayName}.`,
-      `Pair wait: ${pairWaitMinutes} minutes.`,
-      `Own cooldown clears at: ${formatTimeForUser(ownCooldownEligibleAt)}.`,
-      `I will call you at: ${formatTimeForUser(nextEligibleAt)}.`,
-    ].join("\n")
-  );
+  const messageLines = [
+    `Next selected: ${nextSupplement.displayName}.`,
+    "",
+    `I will call you at: ${formatTimeForUser(nextEligibleAt)}.`,
+    `Own cooldown clears at: ${formatTimeForUser(ownCooldownEligibleAt)}.`,
+  ];
+
+  if (activePairWaits.length > 0) {
+    messageLines.push("");
+    messageLines.push("Pair waits from last time each was taken:");
+
+    for (const pairWait of activePairWaits) {
+      messageLines.push(
+        `- ${pairWait.previousSupplement.displayName}: ${pairWait.waitMinutes} min → ${formatTimeForUser(pairWait.eligibleAt)}`
+      );
+    }
+  }
+
+  await context.editMessageText(messageLines.join("\n"));
 });
 
-async function getNextEligibleTime({
-  telegramChatId,
-  previousSupplementId,
-  nextSupplementId,
-  previousConsumedAt,
-}) {
-  const pairWaitEligibleAt = getPairWaitEligibleTime({
-    previousSupplementId,
-    nextSupplementId,
-    previousConsumedAt,
-  });
+async function getEligibleTimeForSupplement({ telegramChatId, supplementId }) {
+  const canonicalSupplementId = resolveSupplementId(supplementId);
 
   const ownCooldownEligibleAt = await getOwnCooldownEligibleTime({
     telegramChatId,
-    supplementId: nextSupplementId,
+    supplementId: canonicalSupplementId,
   });
 
-  const ownCooldownEndsLater = ownCooldownEligibleAt > pairWaitEligibleAt;
+  let latestEligibleAt = ownCooldownEligibleAt;
 
-  if (ownCooldownEndsLater) {
-    return ownCooldownEligibleAt;
+  for (const previousSupplement of supplements) {
+    const waitMinutes = getWaitMinutesBetweenSupplements({
+      previousSupplementId: previousSupplement.id,
+      nextSupplementId: canonicalSupplementId,
+    });
+
+    const noPairWaitForThisCombo = waitMinutes === 0;
+
+    if (noPairWaitForThisCombo) {
+      continue;
+    }
+
+    const lastTakenLog = await getLastConsumedLogForSupplement({
+      telegramChatId,
+      supplementId: previousSupplement.id,
+    });
+
+    if (!lastTakenLog) {
+      continue;
+    }
+
+    const pairWaitEligibleAt = getPairWaitEligibleTime({
+      previousSupplementId: previousSupplement.id,
+      nextSupplementId: canonicalSupplementId,
+      previousConsumedAt: lastTakenLog.taken_at,
+    });
+
+    const pairWaitEndsLater = pairWaitEligibleAt > latestEligibleAt;
+
+    if (pairWaitEndsLater) {
+      latestEligibleAt = pairWaitEligibleAt;
+    }
   }
 
-  return pairWaitEligibleAt;
+  return latestEligibleAt;
+}
+
+async function getActivePairWaitsForSupplement({ telegramChatId, supplementId }) {
+  const canonicalSupplementId = resolveSupplementId(supplementId);
+  const activePairWaits = [];
+
+  for (const previousSupplement of supplements) {
+    const waitMinutes = getWaitMinutesBetweenSupplements({
+      previousSupplementId: previousSupplement.id,
+      nextSupplementId: canonicalSupplementId,
+    });
+
+    const noPairWaitForThisCombo = waitMinutes === 0;
+
+    if (noPairWaitForThisCombo) {
+      continue;
+    }
+
+    const lastTakenLog = await getLastConsumedLogForSupplement({
+      telegramChatId,
+      supplementId: previousSupplement.id,
+    });
+
+    if (!lastTakenLog) {
+      continue;
+    }
+
+    const pairWaitEligibleAt = getPairWaitEligibleTime({
+      previousSupplementId: previousSupplement.id,
+      nextSupplementId: canonicalSupplementId,
+      previousConsumedAt: lastTakenLog.taken_at,
+    });
+
+    activePairWaits.push({
+      previousSupplement,
+      waitMinutes,
+      eligibleAt: pairWaitEligibleAt,
+    });
+  }
+
+  return activePairWaits;
 }
 
 function getPairWaitEligibleTime({
@@ -434,23 +493,14 @@ async function isSupplementOnCooldown({ telegramChatId, supplementId }) {
     return true;
   }
 
-  const lastConsumedLog = await getLastConsumedLogForSupplement({
+  const eligibleAt = await getEligibleTimeForSupplement({
     telegramChatId,
     supplementId,
   });
 
-  if (!lastConsumedLog) {
-    return false;
-  }
+  const notYetEligible = eligibleAt > new Date();
 
-  const cooldownEndsAt = getSupplementCooldownEndTime({
-    supplement,
-    consumedAt: lastConsumedLog.taken_at,
-  });
-
-  const cooldownStillActive = cooldownEndsAt > new Date();
-
-  return cooldownStillActive;
+  return notYetEligible;
 }
 
 async function getOwnCooldownEligibleTime({ telegramChatId, supplementId }) {
@@ -488,31 +538,22 @@ async function getFirstSupplementOffCooldown(telegramChatId) {
   let earliestSupplementId = null;
 
   for (const supplement of supplements) {
-    const lastConsumedLog = await getLastConsumedLogForSupplement({
+    const eligibleAt = await getEligibleTimeForSupplement({
       telegramChatId,
       supplementId: supplement.id,
     });
 
-    if (!lastConsumedLog) {
-      continue;
-    }
+    const alreadyEligibleNow = eligibleAt <= new Date();
 
-    const cooldownEndsAt = getSupplementCooldownEndTime({
-      supplement,
-      consumedAt: lastConsumedLog.taken_at,
-    });
-
-    const cooldownStillActive = cooldownEndsAt > new Date();
-
-    if (!cooldownStillActive) {
+    if (alreadyEligibleNow) {
       continue;
     }
 
     const noEarliestYet = earliestEligibleAt == null;
-    const thisOneIsEarlier = cooldownEndsAt < earliestEligibleAt;
+    const thisOneIsEarlier = eligibleAt < earliestEligibleAt;
 
     if (noEarliestYet || thisOneIsEarlier) {
-      earliestEligibleAt = cooldownEndsAt;
+      earliestEligibleAt = eligibleAt;
       earliestSupplementId = supplement.id;
     }
   }
@@ -565,6 +606,8 @@ function getAllOnCooldownMessage(scheduledReminder) {
 }
 
 async function checkForEligibleSupplements() {
+  await refreshAllLoopStateEligibleTimes();
+
   const now = new Date().toISOString();
 
   const { data: eligibleLoopStates, error } = await supabase
@@ -580,6 +623,53 @@ async function checkForEligibleSupplements() {
 
   for (const loopState of eligibleLoopStates) {
     await sendEligibleSupplementReminder(loopState);
+  }
+}
+
+async function refreshAllLoopStateEligibleTimes() {
+  const { data: loopStates, error } = await supabase
+    .from("loop_states")
+    .select("*");
+
+  if (error) {
+    console.error("Failed to load loop states for refresh:", error);
+    return;
+  }
+
+  for (const loopState of loopStates) {
+    await refreshLoopStateEligibleTime(loopState);
+  }
+}
+
+async function refreshLoopStateEligibleTime(loopState) {
+  const correctEligibleAt = await getEligibleTimeForSupplement({
+    telegramChatId: loopState.telegram_chat_id,
+    supplementId: loopState.next_supplement_id,
+  });
+
+  const storedEligibleAt = new Date(loopState.next_eligible_at);
+  const timesMatch = correctEligibleAt.getTime() === storedEligibleAt.getTime();
+
+  if (timesMatch) {
+    return;
+  }
+
+  const now = new Date();
+  const correctTimeStillInFuture = correctEligibleAt > now;
+  const reminderWasSentTooEarly =
+    loopState.reminder_sent_at != null && correctTimeStillInFuture;
+
+  const { error } = await supabase
+    .from("loop_states")
+    .update({
+      next_eligible_at: correctEligibleAt.toISOString(),
+      reminder_sent_at: reminderWasSentTooEarly ? null : loopState.reminder_sent_at,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("telegram_chat_id", loopState.telegram_chat_id);
+
+  if (error) {
+    console.error("Failed to refresh loop state eligible time:", error);
   }
 }
 
@@ -959,7 +1049,10 @@ bot.catch((error) => {
   console.error("Bot error:", error);
 });
 
-bot.launch();
+bot.launch().then(async () => {
+  await checkForEligibleSupplements();
+  await checkForFinReminders();
+});
 
 setInterval(async () => {
   await checkForEligibleSupplements();
