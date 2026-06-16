@@ -75,12 +75,26 @@ const consumedComments = [
   "Good. We continue.",
 ];
 
+const finMedication = {
+  id: "fin",
+  displayName: "Fin medication",
+  reminderIntervalMinutes: 1440,
+};
+
 bot.start(async (context) => {
   await context.reply("Transmuting inside the abyss, listening.");
 });
 
 bot.command("summon", async (context) => {
   await askWhichSupplementWasConsumed(context);
+});
+
+bot.command("fin", async (context) => {
+  await markFinMedicationTaken(context, { shouldEditMessage: false });
+});
+
+bot.action("fin_taken", async (context) => {
+  await markFinMedicationTaken(context, { shouldEditMessage: true });
 });
 
 bot.on("text", async (context) => {
@@ -102,14 +116,11 @@ bot.on("text", async (context) => {
 
 async function askWhichSupplementWasConsumed(context) {
   const telegramChatId = String(context.chat.id);
-  const consumedSupplementButtons = await getSupplementChoiceButtons({
-    telegramChatId,
-    actionPrefix: "consumed",
-  });
+  const summonChoiceButtons = await getSummonChoiceButtons(telegramChatId);
 
-  const everySupplementIsOnCooldown = consumedSupplementButtons.length === 0;
+  const nothingToPick = summonChoiceButtons.length === 0;
 
-  if (everySupplementIsOnCooldown) {
+  if (nothingToPick) {
     const scheduledReminder = await scheduleReminderForFirstSupplementOffCooldown(
       telegramChatId
     );
@@ -118,11 +129,41 @@ async function askWhichSupplementWasConsumed(context) {
     return;
   }
 
-  await context.reply("Please pick a vitamin out of the selection.", {
+  await context.reply("Please pick what you took.", {
     reply_markup: {
-      inline_keyboard: consumedSupplementButtons,
+      inline_keyboard: summonChoiceButtons,
     },
   });
+}
+
+async function getSummonChoiceButtons(telegramChatId) {
+  const vitaminButtons = await getSupplementChoiceButtons({
+    telegramChatId,
+    actionPrefix: "consumed",
+  });
+
+  const finButton = await getFinButtonIfReady(telegramChatId);
+
+  if (!finButton) {
+    return vitaminButtons;
+  }
+
+  return [...vitaminButtons, finButton];
+}
+
+async function getFinButtonIfReady(telegramChatId) {
+  const finIsOnCooldown = await isFinOnCooldown(telegramChatId);
+
+  if (finIsOnCooldown) {
+    return null;
+  }
+
+  return [
+    {
+      text: finMedication.displayName,
+      callback_data: "fin_taken",
+    },
+  ];
 }
 
 bot.action(/^consumed:(.+)$/, async (context) => {
@@ -527,6 +568,164 @@ async function checkForEligibleSupplements() {
   }
 }
 
+async function checkForFinReminders() {
+  const { data: finLogs, error } = await supabase
+    .from("taken_logs")
+    .select("*")
+    .eq("supplement_id", finMedication.id)
+    .is("reminder_sent_at", null)
+    .order("taken_at", { ascending: false });
+
+  if (error) {
+    console.error("Failed to check fin reminders:", error);
+    return;
+  }
+
+  const latestFinLogByChat = getLatestFinLogPerChat(finLogs);
+  const now = new Date();
+
+  for (const finLog of latestFinLogByChat.values()) {
+    const nextReminderAt = getFinNextReminderTime(new Date(finLog.taken_at));
+    const reminderIsDue = nextReminderAt <= now;
+
+    if (reminderIsDue) {
+      await sendFinMedicationReminder(finLog);
+    }
+  }
+}
+
+function getLatestFinLogPerChat(finLogs) {
+  const latestFinLogByChat = new Map();
+
+  for (const finLog of finLogs) {
+    const alreadyHaveLogForChat = latestFinLogByChat.has(finLog.telegram_chat_id);
+
+    if (!alreadyHaveLogForChat) {
+      latestFinLogByChat.set(finLog.telegram_chat_id, finLog);
+    }
+  }
+
+  return latestFinLogByChat;
+}
+
+async function sendFinMedicationReminder(finLog) {
+  const telegramChatId = finLog.telegram_chat_id;
+
+  await bot.telegram.sendMessage(
+    telegramChatId,
+    [
+      `Time for your ${finMedication.displayName.toLowerCase()}.`,
+      "",
+      "Mark it below when you have taken it.",
+    ].join("\n"),
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "I took it",
+              callback_data: "fin_taken",
+            },
+          ],
+        ],
+      },
+    }
+  );
+
+  await markFinReminderAsSent(finLog.id);
+}
+
+async function markFinMedicationTaken(context, { shouldEditMessage }) {
+  const telegramChatId = String(context.chat.id);
+
+  const finIsOnCooldown = await isFinOnCooldown(telegramChatId);
+
+  if (finIsOnCooldown) {
+    await context.answerCbQuery("Still on cooldown");
+    return;
+  }
+
+  const takenAt = new Date();
+  const takenAtIso = takenAt.toISOString();
+
+  const finLogWasSaved = await saveConsumedSupplementLog({
+    telegramChatId,
+    supplementId: finMedication.id,
+    consumedAt: takenAtIso,
+  });
+
+  if (!finLogWasSaved) {
+    await context.answerCbQuery("Could not save");
+    await context.reply("I could not save that. Check logs.");
+    return;
+  }
+
+  const nextReminderAt = getFinNextReminderTime(takenAt);
+
+  const confirmationText = [
+    `${finMedication.displayName} taken.`,
+    `Next reminder at: ${formatTimeForUser(nextReminderAt)}.`,
+  ].join("\n");
+
+  await context.answerCbQuery("Recorded");
+
+  if (shouldEditMessage) {
+    await context.editMessageText(confirmationText);
+    return;
+  }
+
+  await context.reply(confirmationText);
+}
+
+function getFinNextReminderTime(takenAt) {
+  const takenTime = takenAt.getTime();
+  const reminderIntervalInMilliseconds =
+    finMedication.reminderIntervalMinutes * 60 * 1000;
+  const nextReminderTime = takenTime + reminderIntervalInMilliseconds;
+
+  return new Date(nextReminderTime);
+}
+
+async function isFinOnCooldown(telegramChatId) {
+  const lastFinLog = await getLastConsumedLogForSupplement({
+    telegramChatId,
+    supplementId: finMedication.id,
+  });
+
+  if (!lastFinLog) {
+    return false;
+  }
+
+  const cooldownEndsAt = getFinCooldownEndTime(lastFinLog.taken_at);
+  const cooldownStillActive = cooldownEndsAt > new Date();
+
+  return cooldownStillActive;
+}
+
+function getFinCooldownEndTime(takenAt) {
+  const takenTime = new Date(takenAt).getTime();
+  const cooldownInMilliseconds =
+    finMedication.reminderIntervalMinutes * 60 * 1000;
+  const cooldownEndTime = takenTime + cooldownInMilliseconds;
+
+  return new Date(cooldownEndTime);
+}
+
+async function markFinReminderAsSent(finLogId) {
+  const reminderSentAt = new Date().toISOString();
+
+  const { error } = await supabase
+    .from("taken_logs")
+    .update({
+      reminder_sent_at: reminderSentAt,
+    })
+    .eq("id", finLogId);
+
+  if (error) {
+    console.error("Failed to mark fin reminder as sent:", error);
+  }
+}
+
 async function sendEligibleSupplementReminder(loopState) {
   const telegramChatId = loopState.telegram_chat_id;
   const nextSupplement = getSupplementById(loopState.next_supplement_id);
@@ -617,6 +816,7 @@ async function getLastConsumedSupplementLog(telegramChatId) {
     .from("taken_logs")
     .select("*")
     .eq("telegram_chat_id", telegramChatId)
+    .neq("supplement_id", finMedication.id)
     .order("taken_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -720,7 +920,10 @@ bot.catch((error) => {
 
 bot.launch();
 
-setInterval(checkForEligibleSupplements, 60 * 1000);
+setInterval(async () => {
+  await checkForEligibleSupplements();
+  await checkForFinReminders();
+}, 60 * 1000);
 
 console.log("Bot running");
 
