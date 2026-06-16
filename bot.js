@@ -46,10 +46,25 @@ const supplements = [
     displayName: "Magnesium",
     selfCooldownMinutes: 1440,
   },
+  {
+    id: "vitamin_c",
+    displayName: "Vitamin C",
+    selfCooldownMinutes: 1440,
+  },
+  {
+    id: "vitamin_b_complex",
+    displayName: "B complex (folate optional)",
+    selfCooldownMinutes: 1440,
+  },
 ];
 
+const supplementIdAliases = {
+  folate: "vitamin_b_complex",
+};
+
 const waitMinutesByPreviousThenNext = {
-  // Vitamin D has no pair-wait rules — only the 24-hour self-cooldown applies.
+  // No entry = 0 minute pair wait. Every supplement still has a 24-hour self-cooldown.
+  // Vitamin D, vitamin C, and B complex have no pair-wait rules here.
 
   iron: {
     zinc: 120,
@@ -167,7 +182,7 @@ async function getFinButtonIfReady(telegramChatId) {
 }
 
 bot.action(/^consumed:(.+)$/, async (context) => {
-  const consumedSupplementId = context.match[1];
+  const consumedSupplementId = resolveSupplementId(context.match[1]);
   const consumedSupplement = getSupplementById(consumedSupplementId);
 
   if (!consumedSupplement) {
@@ -254,7 +269,7 @@ async function getSupplementChoiceButtons({ telegramChatId, actionPrefix }) {
 }
 
 bot.action(/^next:(.+)$/, async (context) => {
-  const nextSupplementId = context.match[1];
+  const nextSupplementId = resolveSupplementId(context.match[1]);
   const nextSupplement = getSupplementById(nextSupplementId);
 
   if (!nextSupplement) {
@@ -830,11 +845,13 @@ async function getLastConsumedSupplementLog(telegramChatId) {
 }
 
 async function getLastConsumedLogForSupplement({ telegramChatId, supplementId }) {
+  const supplementIdsToCheck = getSupplementIdsForHistoryLookup(supplementId);
+
   const { data, error } = await supabase
     .from("taken_logs")
     .select("*")
     .eq("telegram_chat_id", telegramChatId)
-    .eq("supplement_id", supplementId)
+    .in("supplement_id", supplementIdsToCheck)
     .order("taken_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -886,9 +903,33 @@ async function markReminderAsSent(telegramChatId) {
   }
 }
 
+function resolveSupplementId(supplementId) {
+  const aliasTarget = supplementIdAliases[supplementId];
+
+  if (aliasTarget != null) {
+    return aliasTarget;
+  }
+
+  return supplementId;
+}
+
+function getSupplementIdsForHistoryLookup(supplementId) {
+  const canonicalSupplementId = resolveSupplementId(supplementId);
+
+  const isBComplex = canonicalSupplementId === "vitamin_b_complex";
+
+  if (isBComplex) {
+    return ["vitamin_b_complex", "folate"];
+  }
+
+  return [canonicalSupplementId];
+}
+
 function getSupplementById(supplementId) {
+  const canonicalSupplementId = resolveSupplementId(supplementId);
+
   for (const supplement of supplements) {
-    const isSameSupplement = supplement.id === supplementId;
+    const isSameSupplement = supplement.id === canonicalSupplementId;
 
     if (isSameSupplement) {
       return supplement;
