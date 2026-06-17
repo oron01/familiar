@@ -1212,7 +1212,8 @@ async function markFinMedicationTaken(context, { shouldEditMessage }) {
   const finIsOnCooldown = await isFinOnCooldown(telegramChatId);
 
   if (finIsOnCooldown) {
-    await context.answerCbQuery("Still on cooldown");
+    await answerCallbackIfPresent(context, "Still on cooldown");
+    await context.reply("Fin is still on its 24-hour cooldown.");
     return;
   }
 
@@ -1226,7 +1227,7 @@ async function markFinMedicationTaken(context, { shouldEditMessage }) {
   });
 
   if (!finLogWasSaved) {
-    await context.answerCbQuery("Could not save");
+    await answerCallbackIfPresent(context, "Could not save");
     await context.reply("I could not save that. Check logs.");
     return;
   }
@@ -1238,7 +1239,7 @@ async function markFinMedicationTaken(context, { shouldEditMessage }) {
     `Next reminder at: ${formatTimeForUser(nextReminderAt)}.`,
   ].join("\n");
 
-  await context.answerCbQuery("Recorded");
+  await answerCallbackIfPresent(context, "Recorded");
 
   if (shouldEditMessage) {
     await context.editMessageText(confirmationText);
@@ -1509,6 +1510,12 @@ function formatTimeForUser(dateOrIsoTime) {
     dateStyle: "short",
     timeStyle: "short",
   });
+}
+
+async function answerCallbackIfPresent(context, text) {
+  if (context.callbackQuery) {
+    await context.answerCbQuery(text);
+  }
 }
 
 bot.catch((error) => {
