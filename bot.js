@@ -993,18 +993,118 @@ async function checkForEligibleSupplements() {
 }
 
 async function refreshAllLoopStateEligibleTimes() {
-  const { data: loopStates, error } = await supabase
-    .from("loop_states")
-    .select("*");
+  const telegramChatIds = await getAllTelegramChatIdsWithVitaminActivity();
 
-  if (error) {
-    console.error("Failed to load loop states for refresh:", error);
+  for (const telegramChatId of telegramChatIds) {
+    await reconcileLoopStateForChat(telegramChatId);
+  }
+}
+
+async function getAllTelegramChatIdsWithVitaminActivity() {
+  const telegramChatIds = new Set();
+
+  const { data: loopStates, error: loopStatesError } = await supabase
+    .from("loop_states")
+    .select("telegram_chat_id");
+
+  if (loopStatesError) {
+    console.error("Failed to load loop states for chat list:", loopStatesError);
+  } else {
+    for (const loopState of loopStates) {
+      telegramChatIds.add(loopState.telegram_chat_id);
+    }
+  }
+
+  const { data: takenLogs, error: takenLogsError } = await supabase
+    .from("taken_logs")
+    .select("telegram_chat_id")
+    .neq("supplement_id", finMedication.id);
+
+  if (takenLogsError) {
+    console.error("Failed to load taken logs for chat list:", takenLogsError);
+  } else {
+    for (const takenLog of takenLogs) {
+      telegramChatIds.add(takenLog.telegram_chat_id);
+    }
+  }
+
+  return [...telegramChatIds];
+}
+
+async function reconcileLoopStateForChat(telegramChatId) {
+  const soonestReminder = await getSoonestSupplementReminder(telegramChatId);
+
+  if (!soonestReminder) {
     return;
   }
 
-  for (const loopState of loopStates) {
-    await refreshLoopStateEligibleTime(loopState);
+  const currentSchedule = await getVitaminSchedule(telegramChatId);
+  const now = new Date();
+
+  if (!currentSchedule) {
+    await saveLoopState({
+      telegramChatId,
+      nextSupplementId: soonestReminder.supplementId,
+      nextEligibleAt: soonestReminder.eligibleAt.toISOString(),
+    });
+    return;
   }
+
+  const currentEligibleAt = new Date(currentSchedule.next_eligible_at);
+  const schedulePointsToSameSupplement =
+    currentSchedule.next_supplement_id === soonestReminder.supplementId;
+
+  const soonestIsDueNow = soonestReminder.eligibleAt <= now;
+  const currentScheduleIsStillInFuture = currentEligibleAt > now;
+  const soonestIsSoonerThanCurrent = soonestReminder.eligibleAt < currentEligibleAt;
+
+  const somethingDueNowWhileWaitingOnLaterSchedule =
+    soonestIsDueNow &&
+    currentScheduleIsStillInFuture &&
+    !schedulePointsToSameSupplement;
+
+  const shouldSwitchToSoonestReminder =
+    somethingDueNowWhileWaitingOnLaterSchedule || soonestIsSoonerThanCurrent;
+
+  if (shouldSwitchToSoonestReminder) {
+    await saveLoopState({
+      telegramChatId,
+      nextSupplementId: soonestReminder.supplementId,
+      nextEligibleAt: soonestReminder.eligibleAt.toISOString(),
+    });
+    return;
+  }
+
+  await refreshLoopStateEligibleTime(currentSchedule);
+}
+
+async function getSoonestSupplementReminder(telegramChatId) {
+  let soonestSupplementId = null;
+  let soonestEligibleAt = null;
+
+  for (const supplement of supplements) {
+    const eligibleAt = await getEligibleTimeForSupplement({
+      telegramChatId,
+      supplementId: supplement.id,
+    });
+
+    const noSoonestYet = soonestEligibleAt == null;
+    const thisOneIsSooner = eligibleAt < soonestEligibleAt;
+
+    if (noSoonestYet || thisOneIsSooner) {
+      soonestEligibleAt = eligibleAt;
+      soonestSupplementId = supplement.id;
+    }
+  }
+
+  if (soonestSupplementId == null) {
+    return null;
+  }
+
+  return {
+    supplementId: soonestSupplementId,
+    eligibleAt: soonestEligibleAt,
+  };
 }
 
 async function refreshLoopStateEligibleTime(loopState) {
