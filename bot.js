@@ -552,10 +552,26 @@ function getUndoWindowStartTime() {
 }
 
 async function maybePromptAfterVitaminUndo(context, { telegramChatId, undoneSupplementId }) {
-  const vitaminScheduleExists = await hasVitaminSchedule(telegramChatId);
+  const supplement = getSupplementById(undoneSupplementId);
+  const statusMessage = await buildUndoStatusMessage({
+    telegramChatId,
+    supplementId: undoneSupplementId,
+  });
 
-  if (vitaminScheduleExists) {
-    await context.reply("Your vitamin reminder schedule is unchanged.");
+  const vitaminSchedule = await getVitaminSchedule(telegramChatId);
+
+  if (vitaminSchedule) {
+    const scheduledSupplement = getSupplementById(
+      vitaminSchedule.next_supplement_id
+    );
+
+    await context.reply(
+      [
+        statusMessage,
+        "",
+        `Scheduled reminder unchanged: ${scheduledSupplement.displayName} at ${formatTimeForUser(vitaminSchedule.next_eligible_at)}.`,
+      ].join("\n")
+    );
     return;
   }
 
@@ -565,14 +581,12 @@ async function maybePromptAfterVitaminUndo(context, { telegramChatId, undoneSupp
   });
 
   if (!pairWaitsAreClear) {
-    await context.reply("Pair waits still apply before that can come up again.");
+    await context.reply(statusMessage);
     return;
   }
 
-  const supplement = getSupplementById(undoneSupplementId);
-
   await context.reply(
-    `Nothing is scheduled. Mark ${supplement.displayName} if you are taking it now:`,
+    `${statusMessage}\n\nNothing is scheduled. Mark ${supplement.displayName} if you are taking it now:`,
     {
       reply_markup: {
         inline_keyboard: [
@@ -586,6 +600,63 @@ async function maybePromptAfterVitaminUndo(context, { telegramChatId, undoneSupp
       },
     }
   );
+}
+
+async function buildUndoStatusMessage({ telegramChatId, supplementId }) {
+  const supplement = getSupplementById(supplementId);
+  const onSelfCooldown = await isSupplementOnSelfCooldown({
+    telegramChatId,
+    supplementId,
+  });
+
+  if (onSelfCooldown) {
+    const selfCooldownClearsAt = await getOwnCooldownEligibleTime({
+      telegramChatId,
+      supplementId,
+    });
+
+    return `${supplement.displayName} still has a 24h cooldown from an older log (clears at ${formatTimeForUser(selfCooldownClearsAt)}).`;
+  }
+
+  const pairWaitsClearAt = await getEligibleTimeFromPairWaitsOnly({
+    telegramChatId,
+    supplementId,
+  });
+
+  const pairWaitsStillActive = pairWaitsClearAt > new Date();
+
+  if (pairWaitsStillActive) {
+    return [
+      `${supplement.displayName} has no 24h cooldown.`,
+      `Pair waits clear at: ${formatTimeForUser(pairWaitsClearAt)}.`,
+    ].join("\n");
+  }
+
+  return `${supplement.displayName} has no 24h cooldown. Pair waits: clear.`;
+}
+
+async function isSupplementOnSelfCooldown({ telegramChatId, supplementId }) {
+  const supplement = getSupplementById(supplementId);
+
+  if (!supplement) {
+    return true;
+  }
+
+  const lastConsumedLog = await getLastConsumedLogForSupplement({
+    telegramChatId,
+    supplementId,
+  });
+
+  if (!lastConsumedLog) {
+    return false;
+  }
+
+  const cooldownEndsAt = getSupplementCooldownEndTime({
+    supplement,
+    consumedAt: lastConsumedLog.taken_at,
+  });
+
+  return cooldownEndsAt > new Date();
 }
 
 async function maybePromptAfterFinUndo(context, telegramChatId) {
@@ -610,19 +681,25 @@ async function maybePromptAfterFinUndo(context, telegramChatId) {
   });
 }
 
-async function hasVitaminSchedule(telegramChatId) {
+async function getVitaminSchedule(telegramChatId) {
   const { data: loopState, error } = await supabase
     .from("loop_states")
-    .select("telegram_chat_id")
+    .select("*")
     .eq("telegram_chat_id", telegramChatId)
     .maybeSingle();
 
   if (error) {
     console.error("Failed to check vitamin schedule:", error);
-    return false;
+    return null;
   }
 
-  return loopState != null;
+  return loopState;
+}
+
+async function hasVitaminSchedule(telegramChatId) {
+  const vitaminSchedule = await getVitaminSchedule(telegramChatId);
+
+  return vitaminSchedule != null;
 }
 
 async function isSupplementClearByPairWaitsOnly({ telegramChatId, supplementId }) {
