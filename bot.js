@@ -356,7 +356,7 @@ bot.action(/^next:(.+)$/, async (context) => {
     return;
   }
 
-  const ownCooldownEligibleAt = await getOwnCooldownEligibleTime({
+  const ownCooldownStatus = await getOwnCooldownStatus({
     telegramChatId,
     supplementId: nextSupplementId,
   });
@@ -371,8 +371,8 @@ bot.action(/^next:(.+)$/, async (context) => {
   const messageLines = [
     `Next selected: ${nextSupplement.displayName}.`,
     "",
-    `I will call you at: ${formatTimeForUser(nextEligibleAt)}.`,
-    `Own cooldown clears at: ${formatTimeForUser(ownCooldownEligibleAt)}.`,
+    `I will call you ${formatReminderTime(nextEligibleAt)}.`,
+    ownCooldownStatus,
   ];
 
   if (activePairWaits.length > 0) {
@@ -380,9 +380,11 @@ bot.action(/^next:(.+)$/, async (context) => {
     messageLines.push("Pair waits from last time each was taken:");
 
     for (const pairWait of activePairWaits) {
-      messageLines.push(
-        `- ${pairWait.previousSupplement.displayName}: ${pairWait.waitMinutes} min → ${formatTimeForUser(pairWait.eligibleAt)}`
-      );
+      const pairWaitLine = pairWait.eligibleAt <= new Date()
+        ? `- ${pairWait.previousSupplement.displayName}: ${pairWait.waitMinutes} min → clear`
+        : `- ${pairWait.previousSupplement.displayName}: ${pairWait.waitMinutes} min → ${formatTimeForUser(pairWait.eligibleAt)}`;
+
+      messageLines.push(pairWaitLine);
     }
   }
 
@@ -433,10 +435,8 @@ async function getEligibleTimeForSupplement({ telegramChatId, supplementId }) {
     }
   }
 
-  return latestEligibleAt;
+  return clampEligibleTimeToNow(latestEligibleAt);
 }
-
-async function showUndoChoices(context) {
   const telegramChatId = String(context.chat.id);
   const recentLogs = await getMostRecentLogsPerSupplementInUndoWindow(telegramChatId);
 
@@ -885,10 +885,70 @@ async function getOwnCooldownEligibleTime({ telegramChatId, supplementId }) {
     return new Date();
   }
 
-  return getSupplementCooldownEndTime({
+  const cooldownEndsAt = getSupplementCooldownEndTime({
     supplement,
     consumedAt: lastConsumedLog.taken_at,
   });
+
+  const selfCooldownAlreadyPassed = cooldownEndsAt <= new Date();
+
+  if (selfCooldownAlreadyPassed) {
+    return new Date();
+  }
+
+  return cooldownEndsAt;
+}
+
+async function getOwnCooldownStatus({ telegramChatId, supplementId }) {
+  const supplement = getSupplementById(supplementId);
+
+  if (!supplement) {
+    return "Own cooldown: unknown.";
+  }
+
+  const lastConsumedLog = await getLastConsumedLogForSupplement({
+    telegramChatId,
+    supplementId,
+  });
+
+  if (!lastConsumedLog) {
+    return "Own cooldown: never taken.";
+  }
+
+  const cooldownEndsAt = getSupplementCooldownEndTime({
+    supplement,
+    consumedAt: lastConsumedLog.taken_at,
+  });
+
+  const selfCooldownAlreadyPassed = cooldownEndsAt <= new Date();
+
+  if (selfCooldownAlreadyPassed) {
+    return "Own cooldown: clear.";
+  }
+
+  return `Own cooldown clears at: ${formatTimeForUser(cooldownEndsAt)}.`;
+}
+
+function clampEligibleTimeToNow(eligibleAt) {
+  const now = new Date();
+  const alreadyEligible = eligibleAt <= now;
+
+  if (alreadyEligible) {
+    return now;
+  }
+
+  return eligibleAt;
+}
+
+function formatReminderTime(eligibleAt) {
+  const now = new Date();
+  const readyNow = eligibleAt <= now;
+
+  if (readyNow) {
+    return "now";
+  }
+
+  return `at ${formatTimeForUser(eligibleAt)}`;
 }
 
 function getSupplementCooldownEndTime({ supplement, consumedAt }) {
