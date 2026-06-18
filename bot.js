@@ -437,6 +437,8 @@ async function getEligibleTimeForSupplement({ telegramChatId, supplementId }) {
 
   return clampEligibleTimeToNow(latestEligibleAt);
 }
+
+async function showUndoChoices(context) {
   const telegramChatId = String(context.chat.id);
   const recentLogs = await getMostRecentLogsPerSupplementInUndoWindow(telegramChatId);
 
