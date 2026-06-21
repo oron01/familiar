@@ -148,7 +148,7 @@ bot.action(/^undo:(.+)$/, async (context) => {
   }
 
   await reconcileLoopStateForChat(telegramChatId);
-  await trySendVitaminReminderForChat(telegramChatId);
+  const reminderWasSent = await sendOneVitaminReminderAfterUndo(telegramChatId);
 
   await context.answerCbQuery(`Reversed ${supplement.displayName}`);
 
@@ -164,6 +164,7 @@ bot.action(/^undo:(.+)$/, async (context) => {
   await maybePromptAfterVitaminUndo(context, {
     telegramChatId,
     undoneSupplementId: supplementIdToUndo,
+    reminderWasSent,
   });
 });
 
@@ -674,7 +675,10 @@ function getUndoWindowStartTime() {
   return new Date(undoWindowStart);
 }
 
-async function maybePromptAfterVitaminUndo(context, { telegramChatId, undoneSupplementId }) {
+async function maybePromptAfterVitaminUndo(
+  context,
+  { telegramChatId, undoneSupplementId, reminderWasSent }
+) {
   const supplement = getSupplementById(undoneSupplementId);
   const statusMessage = await buildUndoStatusMessage({
     telegramChatId,
@@ -725,7 +729,12 @@ async function maybePromptAfterVitaminUndo(context, { telegramChatId, undoneSupp
   ];
 
   if (reminderIsDueNow) {
-    messageLines.push("I will ping you shortly.");
+    if (reminderWasSent) {
+      messageLines.push("Pinged you once with options.");
+    } else {
+      messageLines.push("Due now. Use /refresh if you need options.");
+    }
+
     await context.reply(messageLines.join("\n"));
     return;
   }
@@ -1272,20 +1281,42 @@ async function reconcileLoopStateForChat(telegramChatId) {
   await refreshLoopStateEligibleTime(currentSchedule);
 }
 
-async function trySendVitaminReminderForChat(telegramChatId) {
+async function sendOneVitaminReminderAfterUndo(telegramChatId) {
   const vitaminSchedule = await getVitaminSchedule(telegramChatId);
 
   if (!vitaminSchedule) {
-    return;
+    return false;
   }
 
   const reminderIsDueNow =
     new Date(vitaminSchedule.next_eligible_at) <= new Date();
-  const reminderNotSentYet = vitaminSchedule.reminder_sent_at == null;
 
-  if (reminderIsDueNow && reminderNotSentYet) {
-    await sendEligibleSupplementReminder(vitaminSchedule);
+  if (!reminderIsDueNow) {
+    return false;
   }
+
+  const { error: resetError } = await supabase
+    .from("loop_states")
+    .update({
+      reminder_sent_at: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("telegram_chat_id", telegramChatId);
+
+  if (resetError) {
+    console.error("Failed to reset reminder for undo:", resetError);
+    return false;
+  }
+
+  const freshSchedule = await getVitaminSchedule(telegramChatId);
+
+  if (!freshSchedule) {
+    return false;
+  }
+
+  await sendEligibleSupplementReminder(freshSchedule);
+
+  return true;
 }
 
 async function getSoonestSupplementReminder(telegramChatId) {
