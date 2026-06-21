@@ -118,6 +118,10 @@ bot.command("undo", async (context) => {
   await showUndoChoices(context);
 });
 
+bot.command("refresh", async (context) => {
+  await sendFreshOptionsPrompt(context);
+});
+
 bot.action(/^undo:(.+)$/, async (context) => {
   const supplementIdToUndo = resolveSupplementId(context.match[1]);
   const telegramChatId = String(context.chat.id);
@@ -195,11 +199,11 @@ async function askWhichSupplementWasConsumed(context) {
     return;
   }
 
-  await context.reply("Please pick what you took.", {
-    reply_markup: {
-      inline_keyboard: summonChoiceButtons,
-    },
-  });
+  await replyWithOptions(
+    context,
+    "Please pick what you took.",
+    summonChoiceButtons
+  );
 }
 
 async function getSummonChoiceButtons(telegramChatId) {
@@ -292,15 +296,131 @@ bot.action(/^consumed:(.+)$/, async (context) => {
     return;
   }
 
-  await context.reply(
+  await replyWithOptions(
+    context,
     `${consumedComment}\n\nPlease pick the next vitamin for consumption.`,
-    {
-      reply_markup: {
-        inline_keyboard: nextSupplementButtons,
-      },
-    }
+    nextSupplementButtons
   );
 });
+
+async function sendFreshOptionsPrompt(context) {
+  const telegramChatId = String(context.chat.id);
+  const optionButtons = await getSummonChoiceButtons(telegramChatId);
+
+  if (optionButtons.length === 0) {
+    await clearPreviousOptionsMessages(telegramChatId);
+    await context.reply(
+      "Nothing available right now. Old buttons cleared. Timers unchanged."
+    );
+    return;
+  }
+
+  await replyWithOptions(
+    context,
+    "Fresh options. Timers unchanged.",
+    optionButtons
+  );
+}
+
+async function replyWithOptions(context, text, inlineKeyboard) {
+  const telegramChatId = String(context.chat.id);
+
+  await clearPreviousOptionsMessages(telegramChatId);
+
+  const message = await context.reply(text, {
+    reply_markup: {
+      inline_keyboard: inlineKeyboard,
+    },
+  });
+
+  await trackOptionsMessage(telegramChatId, message.message_id);
+
+  return message;
+}
+
+async function sendMessageWithOptions(telegramChatId, text, inlineKeyboard) {
+  await clearPreviousOptionsMessages(telegramChatId);
+
+  const message = await bot.telegram.sendMessage(telegramChatId, text, {
+    reply_markup: {
+      inline_keyboard: inlineKeyboard,
+    },
+  });
+
+  await trackOptionsMessage(telegramChatId, message.message_id);
+
+  return message;
+}
+
+async function trackOptionsMessage(telegramChatId, messageId) {
+  const { data: existingState, error: readError } = await supabase
+    .from("chat_ui_state")
+    .select("last_options_message_ids")
+    .eq("telegram_chat_id", telegramChatId)
+    .maybeSingle();
+
+  if (readError) {
+    console.error("Failed to read chat ui state:", readError);
+    return;
+  }
+
+  const previousMessageIds = existingState?.last_options_message_ids || [];
+  const updatedMessageIds = [...previousMessageIds, messageId].slice(-5);
+
+  const { error: writeError } = await supabase.from("chat_ui_state").upsert({
+    telegram_chat_id: telegramChatId,
+    last_options_message_ids: updatedMessageIds,
+    updated_at: new Date().toISOString(),
+  });
+
+  if (writeError) {
+    console.error("Failed to save chat ui state:", writeError);
+  }
+}
+
+async function clearPreviousOptionsMessages(telegramChatId) {
+  const { data: uiState, error: readError } = await supabase
+    .from("chat_ui_state")
+    .select("last_options_message_ids")
+    .eq("telegram_chat_id", telegramChatId)
+    .maybeSingle();
+
+  if (readError) {
+    console.error("Failed to read chat ui state for clear:", readError);
+    return;
+  }
+
+  const messageIdsToClear = uiState?.last_options_message_ids || [];
+
+  for (const messageId of messageIdsToClear) {
+    try {
+      await bot.telegram.editMessageReplyMarkup(
+        telegramChatId,
+        messageId,
+        undefined,
+        { inline_keyboard: [] }
+      );
+    } catch (error) {
+      // Message may have been deleted or is too old to edit.
+    }
+  }
+
+  if (messageIdsToClear.length === 0) {
+    return;
+  }
+
+  const { error: writeError } = await supabase
+    .from("chat_ui_state")
+    .update({
+      last_options_message_ids: [],
+      updated_at: new Date().toISOString(),
+    })
+    .eq("telegram_chat_id", telegramChatId);
+
+  if (writeError) {
+    console.error("Failed to clear chat ui state:", writeError);
+  }
+}
 
 async function getSupplementChoiceButtons({ telegramChatId, actionPrefix }) {
   const availableSupplements = await getSupplementsNotOnCooldown(telegramChatId);
@@ -1301,25 +1421,21 @@ function getLatestFinLogPerChat(finLogs) {
 async function sendFinMedicationReminder(finLog) {
   const telegramChatId = finLog.telegram_chat_id;
 
-  await bot.telegram.sendMessage(
+  await sendMessageWithOptions(
     telegramChatId,
     [
       `Time for your ${finMedication.displayName.toLowerCase()}.`,
       "",
       "Mark it below when you have taken it.",
     ].join("\n"),
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "I took it",
-              callback_data: "fin_taken",
-            },
-          ],
-        ],
-      },
-    }
+    [
+      [
+        {
+          text: "I took it",
+          callback_data: "fin_taken",
+        },
+      ],
+    ]
   );
 
   await markFinReminderAsSent(finLog.id);
@@ -1426,31 +1542,27 @@ async function sendEligibleSupplementReminder(loopState) {
     return;
   }
 
-  await bot.telegram.sendMessage(
+  await sendMessageWithOptions(
     telegramChatId,
     [
       `${nextSupplement.displayName} is eligible now.`,
       "",
       "Please consume it, then mark it below.",
     ].join("\n"),
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: `Consumed ${nextSupplement.displayName}`,
-              callback_data: `consumed:${nextSupplement.id}`,
-            },
-          ],
-          [
-            {
-              text: "Choose something else",
-              callback_data: "choose_next_again",
-            },
-          ],
-        ],
-      },
-    }
+    [
+      [
+        {
+          text: `Consumed ${nextSupplement.displayName}`,
+          callback_data: `consumed:${nextSupplement.id}`,
+        },
+      ],
+      [
+        {
+          text: "Choose something else",
+          callback_data: "choose_next_again",
+        },
+      ],
+    ]
   );
 
   await markReminderAsSent(telegramChatId);
@@ -1481,6 +1593,11 @@ bot.action("choose_next_again", async (context) => {
       inline_keyboard: nextSupplementButtons,
     },
   });
+
+  await trackOptionsMessage(
+    telegramChatId,
+    context.callbackQuery.message.message_id
+  );
 });
 
 async function saveConsumedSupplementLog({

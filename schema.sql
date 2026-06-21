@@ -28,3 +28,9 @@ create index if not exists loop_states_eligible
 -- Fin doses use taken_logs with supplement_id = 'fin'.
 -- Fin reminder timing is taken_at + 24h; reminder_sent_at on that row
 -- records whether the ping was already sent. Vitamins ignore that column.
+
+create table if not exists chat_ui_state (
+  telegram_chat_id text primary key,
+  last_options_message_ids bigint[] not null default '{}',
+  updated_at timestamptz not null
+);
