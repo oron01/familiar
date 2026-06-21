@@ -18,7 +18,8 @@ create table if not exists loop_states (
   next_supplement_id text not null,
   next_eligible_at timestamptz not null,
   reminder_sent_at timestamptz,
-  updated_at timestamptz not null
+  updated_at timestamptz not null,
+  last_options_message_ids bigint[] not null default '{}'
 );
 
 create index if not exists loop_states_eligible
@@ -34,3 +35,6 @@ create table if not exists chat_ui_state (
   last_options_message_ids bigint[] not null default '{}',
   updated_at timestamptz not null
 );
+
+-- Existing loop_states table? Run once in Supabase:
+-- alter table loop_states add column if not exists last_options_message_ids bigint[] not null default '{}';
