@@ -1150,6 +1150,35 @@ async function reconcileLoopStateForChat(telegramChatId) {
   }
 
   await refreshLoopStateEligibleTime(currentSchedule);
+  await clearStuckReminderIfDueNow(telegramChatId);
+}
+
+async function clearStuckReminderIfDueNow(telegramChatId) {
+  const vitaminSchedule = await getVitaminSchedule(telegramChatId);
+
+  if (!vitaminSchedule) {
+    return;
+  }
+
+  const reminderIsDueNow =
+    new Date(vitaminSchedule.next_eligible_at) <= new Date();
+  const reminderAlreadyMarkedSent = vitaminSchedule.reminder_sent_at != null;
+
+  if (!reminderIsDueNow || !reminderAlreadyMarkedSent) {
+    return;
+  }
+
+  const { error } = await supabase
+    .from("loop_states")
+    .update({
+      reminder_sent_at: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("telegram_chat_id", telegramChatId);
+
+  if (error) {
+    console.error("Failed to clear stuck reminder:", error);
+  }
 }
 
 async function trySendVitaminReminderForChat(telegramChatId) {
