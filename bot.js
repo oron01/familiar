@@ -143,7 +143,8 @@ bot.action(/^undo:(.+)$/, async (context) => {
     return;
   }
 
-  await refreshAllLoopStateEligibleTimes();
+  await reconcileLoopStateForChat(telegramChatId);
+  await trySendVitaminReminderForChat(telegramChatId);
 
   await context.answerCbQuery(`Reversed ${supplement.displayName}`);
 
@@ -562,46 +563,57 @@ async function maybePromptAfterVitaminUndo(context, { telegramChatId, undoneSupp
 
   const vitaminSchedule = await getVitaminSchedule(telegramChatId);
 
-  if (vitaminSchedule) {
-    const scheduledSupplement = getSupplementById(
-      vitaminSchedule.next_supplement_id
-    );
+  if (!vitaminSchedule) {
+    const pairWaitsAreClear = await isSupplementClearByPairWaitsOnly({
+      telegramChatId,
+      supplementId: undoneSupplementId,
+    });
+
+    if (!pairWaitsAreClear) {
+      await context.reply(statusMessage);
+      return;
+    }
 
     await context.reply(
-      [
-        statusMessage,
-        "",
-        `Scheduled reminder unchanged: ${scheduledSupplement.displayName} at ${formatTimeForUser(vitaminSchedule.next_eligible_at)}.`,
-      ].join("\n")
+      `${statusMessage}\n\nNothing is scheduled. Mark ${supplement.displayName} if you are taking it now:`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: supplement.displayName,
+                callback_data: `consumed:${supplement.id}`,
+              },
+            ],
+          ],
+        },
+      }
     );
     return;
   }
 
-  const pairWaitsAreClear = await isSupplementClearByPairWaitsOnly({
-    telegramChatId,
-    supplementId: undoneSupplementId,
-  });
+  const scheduledSupplement = getSupplementById(
+    vitaminSchedule.next_supplement_id
+  );
+  const reminderIsDueNow =
+    new Date(vitaminSchedule.next_eligible_at) <= new Date();
 
-  if (!pairWaitsAreClear) {
-    await context.reply(statusMessage);
+  const messageLines = [
+    statusMessage,
+    "",
+    `Next reminder: ${scheduledSupplement.displayName} ${formatReminderTime(new Date(vitaminSchedule.next_eligible_at))}.`,
+  ];
+
+  if (reminderIsDueNow) {
+    messageLines.push("I will ping you shortly.");
+    await context.reply(messageLines.join("\n"));
     return;
   }
 
-  await context.reply(
-    `${statusMessage}\n\nNothing is scheduled. Mark ${supplement.displayName} if you are taking it now:`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: supplement.displayName,
-              callback_data: `consumed:${supplement.id}`,
-            },
-          ],
-        ],
-      },
-    }
+  messageLines.push(
+    `That is at: ${formatTimeForUser(vitaminSchedule.next_eligible_at)}.`
   );
+  await context.reply(messageLines.join("\n"));
 }
 
 async function buildUndoStatusMessage({ telegramChatId, supplementId }) {
@@ -1138,6 +1150,22 @@ async function reconcileLoopStateForChat(telegramChatId) {
   }
 
   await refreshLoopStateEligibleTime(currentSchedule);
+}
+
+async function trySendVitaminReminderForChat(telegramChatId) {
+  const vitaminSchedule = await getVitaminSchedule(telegramChatId);
+
+  if (!vitaminSchedule) {
+    return;
+  }
+
+  const reminderIsDueNow =
+    new Date(vitaminSchedule.next_eligible_at) <= new Date();
+  const reminderNotSentYet = vitaminSchedule.reminder_sent_at == null;
+
+  if (reminderIsDueNow && reminderNotSentYet) {
+    await sendEligibleSupplementReminder(vitaminSchedule);
+  }
 }
 
 async function getSoonestSupplementReminder(telegramChatId) {
