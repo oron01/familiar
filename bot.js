@@ -1237,6 +1237,7 @@ function getAllOnCooldownMessage(scheduledReminder) {
 
 async function checkForEligibleSupplements() {
   await refreshAllLoopStateEligibleTimes();
+  await clearStaleRemindersBeforeCheck();
 
   const now = new Date().toISOString();
 
@@ -1340,6 +1341,59 @@ async function reconcileLoopStateForChat(telegramChatId) {
   }
 
   await refreshLoopStateEligibleTime(currentSchedule);
+}
+
+async function clearStaleRemindersBeforeCheck() {
+  const now = new Date();
+
+  const { data: loopStates, error } = await supabase
+    .from("loop_states")
+    .select("*");
+
+  if (error) {
+    console.error("Failed to load loop states for stale reminder check:", error);
+    return;
+  }
+
+  for (const loopState of loopStates) {
+    await clearStaleReminderSentIfNeeded(loopState, now);
+  }
+}
+
+async function clearStaleReminderSentIfNeeded(loopState, now) {
+  const reminderIsDueNow = new Date(loopState.next_eligible_at) <= now;
+  const reminderAlreadyMarkedSent = loopState.reminder_sent_at != null;
+
+  if (!reminderIsDueNow || !reminderAlreadyMarkedSent) {
+    return;
+  }
+
+  const reminderSentAt = new Date(loopState.reminder_sent_at);
+  const eligibleAt = new Date(loopState.next_eligible_at);
+
+  const dueTimeMovedAfterLastPing = reminderSentAt < eligibleAt;
+  const twelveHoursInMilliseconds = 12 * 60 * 60 * 1000;
+  const lastPingWasOverTwelveHoursAgo =
+    now.getTime() - reminderSentAt.getTime() > twelveHoursInMilliseconds;
+
+  const shouldAllowAnotherPing =
+    dueTimeMovedAfterLastPing || lastPingWasOverTwelveHoursAgo;
+
+  if (!shouldAllowAnotherPing) {
+    return;
+  }
+
+  const { error } = await supabase
+    .from("loop_states")
+    .update({
+      reminder_sent_at: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("telegram_chat_id", loopState.telegram_chat_id);
+
+  if (error) {
+    console.error("Failed to clear stale reminder:", error);
+  }
 }
 
 async function sendOneVitaminReminderAfterUndo(telegramChatId) {
